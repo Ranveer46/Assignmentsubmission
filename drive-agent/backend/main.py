@@ -1,171 +1,250 @@
+"""
+main.py — FastAPI backend for the Google Drive conversational agent
+
+Endpoints:
+  POST /chat          — send a message, get a streamed reply
+  GET  /health        — cache stats + service health
+  GET  /files         — list all indexed files (for debugging)
+  GET  /files/{id}    — get a single file's metadata
+
+Run:
+  uvicorn main:app --reload --port 8000
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import time
+from typing import AsyncIterator
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
 from agent import create_agent
+from drive_client import (
+    get_cache_stats,
+    get_file_by_id,
+    get_folder_tree,
+    get_recent_files,
+    init_drive_cache,
+    list_all_files,
+)
 from env_loader import load_project_dotenv
 
 load_project_dotenv()
 
-# Cap history length so each /chat request stays smaller (token / context limits).
-CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("CHAT_HISTORY_MAX_MESSAGES", "28"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# App init
+# App
 # ─────────────────────────────────────────────
 
 app = FastAPI(
-    title="Google Drive AI Agent API",
-    description="Conversational API: multi-turn chat that searches and filters a shared Google Drive folder via natural language.",
-    version="1.0.0",
+    title="Drive Agent API",
+    description="Conversational AI agent for Google Drive file discovery.",
+    version="2.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Lazy-init so /health works even when GOOGLE_API_KEY is not loaded yet
+# ─────────────────────────────────────────────
+# Startup — index the Drive folder
+# ─────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    On startup:
+      1. Connect to Google Drive and recursively index the shared folder.
+      2. Start background refresh thread (every CACHE_REFRESH_SECS seconds).
+      3. Create the LangGraph agent.
+    """
+    logger.info("Starting Drive Agent backend…")
+    try:
+        init_drive_cache()       # kicks off recursive scan + background refresh
+        logger.info("Drive cache initialised successfully.")
+    except Exception as exc:
+        logger.error("Drive cache initialisation failed: %s", exc)
+        # Don't crash the server — searches will fall back to API calls
+
+
+# ─────────────────────────────────────────────
+# Request / Response models
+# ─────────────────────────────────────────────
+
+class Message(BaseModel):
+    role: str       # "user" or "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[Message] = []   # full conversation so far
+
+
+class ChatResponse(BaseModel):
+    reply: str
+
+
+# ─────────────────────────────────────────────
+# Agent singleton (created lazily)
+# ─────────────────────────────────────────────
+
 _agent = None
 
 
-def get_agent():
+def _get_agent():
     global _agent
     if _agent is None:
         _agent = create_agent()
     return _agent
 
 
-# In-memory session store: session_id → list of LangChain messages
-sessions: dict[str, list] = {}
-
-
 # ─────────────────────────────────────────────
-# Models
+# Endpoints
 # ─────────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-
-
-def _trim_history(msgs: list) -> list:
-    """Keep only the last N messages; drop leading ToolMessages to avoid a broken tool chain."""
-    if len(msgs) <= CHAT_HISTORY_MAX_MESSAGES:
-        return msgs
-    tail = list(msgs[-CHAT_HISTORY_MAX_MESSAGES :])
-    while tail and isinstance(tail[0], ToolMessage):
-        tail.pop(0)
-    return tail
-
-
-def _is_provider_rate_limit(exc: BaseException) -> bool:
-    s = str(exc).lower()
-    return (
-        "429" in str(exc)
-        or "resource_exhausted" in s
-        or ("quota" in s and "exceed" in s)
-        or "rate_limit" in s
-        or "rate limit" in s
-    )
-
-
-# ─────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────
-
-@app.get("/")
-async def root():
-    return {"message": "Google Drive AI Agent is running 🚀", "docs": "/docs"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
-    Send a message to the Drive agent and receive a response.
-    Chat history is maintained per session_id.
+    Send a user message to the Drive agent and get a reply.
+
+    The `history` field carries the full conversation so the agent
+    can handle follow-up questions ("those", "narrow it to PDFs", etc.).
+
+    Example request:
+        {
+          "message": "find invoices from last month",
+          "history": [
+            {"role": "user",      "content": "hi"},
+            {"role": "assistant", "content": "Hello! How can I help with your Drive?"}
+          ]
+        }
     """
-    if not req.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    agent = _get_agent()
 
-    history = sessions.setdefault(req.session_id, [])
+    # Build LangGraph message list: history + new user message
+    messages = []
+    for m in req.history:
+        messages.append({"role": m.role, "content": m.content})
+    messages.append({"role": "user", "content": req.message})
 
-    trimmed = _trim_history(history)
-    if len(trimmed) < len(history):
-        history[:] = trimmed
-
-    # Build messages: history + new user message
-    messages = history + [HumanMessage(content=req.message)]
-
-    # Retry up to 3 times on rate-limit errors with exponential backoff (5s, 10s, 20s)
-    _RETRY_DELAYS = [5, 10, 20]
-    last_exc: Exception | None = None
-    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
-        if delay:
-            time.sleep(delay)
-        try:
-            result = get_agent().invoke({"messages": messages})
-            last_exc = None
-            break  # success
-        except Exception as e:
-            last_exc = e
-            if not _is_provider_rate_limit(e):
-                # Non-rate-limit error — surface immediately
-                raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
-            # Rate limit — will retry (or fall through after last attempt)
-
-    if last_exc is not None:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "Groq API rate limit or quota exceeded. "
-                "Retried 3 times with backoff but still hitting limits. "
-                "Wait a minute and retry, use Clear Chat to shorten context, "
-                "try a smaller/faster model via GROQ_MODEL in .env (e.g. llama-3.1-8b-instant), "
-                "or check your limits at https://console.groq.com/"
-            ),
+    try:
+        result = agent.invoke({"messages": messages})
+        # LangGraph returns the full message list; last message is the reply
+        reply_msg = result["messages"][-1]
+        reply_text = (
+            reply_msg.content
+            if isinstance(reply_msg.content, str)
+            else str(reply_msg.content)
         )
+        return ChatResponse(reply=reply_text)
 
-    # Extract the final AI response from the result messages
-    output_messages = result.get("messages", [])
-    reply = ""
-    for msg in reversed(output_messages):
-        if isinstance(msg, AIMessage) and msg.content:
-            reply = msg.content
-            break
-
-    if not reply:
-        reply = "I couldn't generate a response. Please try again."
-
-    # Persist capped history so sessions do not grow without bound (saves Groq TPD).
-    sessions[req.session_id] = _trim_history(output_messages)
-
-    return ChatResponse(response=reply, session_id=req.session_id)
+    except Exception as exc:
+        logger.exception("Agent invocation failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.delete("/session/{session_id}")
-async def clear_session(session_id: str):
-    """Clear the chat history for a given session."""
-    sessions.pop(session_id, None)
-    return {"message": f"Session {session_id} cleared."}
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Streaming variant of /chat.
+    Returns server-sent events so the frontend can show a typing effect.
+
+    Usage in the frontend:
+        const res = await fetch('/chat/stream', { method: 'POST', body: ... })
+        const reader = res.body.getReader()
+        ...
+    """
+    agent = _get_agent()
+
+    messages = []
+    for m in req.history:
+        messages.append({"role": m.role, "content": m.content})
+    messages.append({"role": "user", "content": req.message})
+
+    async def token_stream() -> AsyncIterator[str]:
+        try:
+            async for event in agent.astream_events(
+                {"messages": messages}, version="v2"
+            ):
+                kind = event.get("event")
+                # Emit only LLM text chunks
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        yield f"data: {chunk.content}\n\n"
+        except Exception as exc:
+            logger.exception("Streaming error")
+            yield f"data: [ERROR] {exc}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        token_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-@app.get("/sessions")
-async def list_sessions():
-    """List all active session IDs and their message counts."""
-    return {sid: len(msgs) for sid, msgs in sessions.items()}
+@app.get("/health")
+async def health():
+    """
+    Returns Drive cache statistics and server health.
+    Useful to confirm the folder was indexed correctly.
+
+    Example response:
+        {
+          "status": "ok",
+          "cache": {
+            "total_files": 142,
+            "last_refresh": 1715000000.0,
+            "refresh_interval_secs": 300,
+            "mime_breakdown": { "application/pdf": 40, "image/png": 22, ... }
+          }
+        }
+    """
+    stats = get_cache_stats()
+    return {"status": "ok", "cache": stats}
+
+
+@app.get("/files")
+async def list_files_endpoint(limit: int = 200):
+    """
+    List all indexed files (capped at `limit`).
+    Useful for debugging — check what the agent can see.
+    """
+    files = list_all_files()[:limit]
+    return {"total": len(list_all_files()), "returned": len(files), "files": files}
+
+
+@app.get("/files/recent")
+async def recent_files(n: int = 20):
+    """Return the n most recently modified files."""
+    return {"files": get_recent_files(n)}
+
+
+@app.get("/files/tree")
+async def folder_tree():
+    """Return the folder hierarchy as a path → files map."""
+    return {"tree": get_folder_tree()}
+
+
+@app.get("/files/{file_id}")
+async def get_file(file_id: str):
+    """Return metadata for a single file by Drive ID."""
+    f = get_file_by_id(file_id)
+    if not f:
+        raise HTTPException(status_code=404, detail="File not found")
+    return f
