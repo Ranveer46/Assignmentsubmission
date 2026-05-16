@@ -111,9 +111,15 @@ def _file_entry_markdown(f: dict) -> str:
     )
 
 
-def _format_files(files: list[dict], category_label: str = "") -> str:
+def _format_files(files: list[dict], category_label: str = "", max_files: int = 40) -> str:
     if not files:
         return f"No {category_label or 'files'} found."
+
+    total_count = len(files)
+    truncated = False
+    if total_count > max_files:
+        files = files[:max_files]
+        truncated = True
 
     buckets: dict[str, list[dict]] = {}
     for f in files:
@@ -138,7 +144,10 @@ def _format_files(files: list[dict], category_label: str = "") -> str:
                 + "\n\n".join(_file_entry_markdown(f) for f in group)
             )
 
-    header = f"Found **{len(files)}** {category_label or 'file(s)'}:\n\n"
+    header = f"Found **{total_count}** {category_label or 'file(s)'}"
+    if truncated:
+        header += f" *(showing first {max_files} to fit in token limits)*"
+    header += ":\n\n"
     return header + "\n\n".join(sections)
 
 
