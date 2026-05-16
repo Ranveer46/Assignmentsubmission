@@ -1,19 +1,16 @@
 """
-drive_client.py — Google Drive access layer
+drive_client.py — Google Drive access layer (performance-optimised)
 
-What this module does:
-  1. Recursively scans the entire shared folder (all subfolders) at startup
-     and caches the file tree in memory so every search is fast.
-  2. Exposes clean search helpers used by agent.py tools.
-  3. Supports full-text content extraction from Google Docs, PDFs, and DOCX
-     so the agent can do semantic / content-based search.
-  4. Periodic background refresh keeps the in-memory cache up to date
-     without restarting the server.
-
-Environment variables (from .env):
-  FOLDER_ID            — Root Google Drive folder ID
-  GOOGLE_CREDS_FILE    — Path to service_account.json (default: service_account.json)
-  CACHE_REFRESH_SECS   — How often to refresh the file cache (default: 300)
+Fixes applied vs v1:
+  1. _api_search now uses 'in parents' with ALL folder IDs (recursive scope),
+     not just the root — so fullText actually finds files in subfolders.
+  2. Pre-compiled regex patterns in _eval_q (compiled once at import time).
+  3. fullText results are cached for FULLTEXT_CACHE_TTL seconds so repeated
+     queries don't hammer the Drive API.
+  4. get_recent_files result is cached and only re-sorted when the cache refreshes.
+  5. _recursive_list uses a thread pool (up to 8 workers) for concurrent subfolder
+     traversal — cuts cold-start indexing time significantly on deep trees.
+  6. _cache_search short-circuits on trashed=false immediately (no regex needed).
 """
 
 from __future__ import annotations
@@ -21,9 +18,11 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import threading
 import time
-from fnmatch import fnmatch
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from typing import Any
 
 from google.oauth2 import service_account
@@ -41,7 +40,6 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-# Fields fetched for every file — extend here if you need more
 _FILE_FIELDS = (
     "id, name, mimeType, size, modifiedTime, createdTime, "
     "webViewLink, webContentLink, parents, owners, shared, "
@@ -49,6 +47,29 @@ _FILE_FIELDS = (
 )
 
 _CACHE_REFRESH_SECS = int(os.getenv("CACHE_REFRESH_SECS", "300"))
+
+# How long to cache fullText API results (seconds)
+FULLTEXT_CACHE_TTL = int(os.getenv("FULLTEXT_CACHE_TTL", "120"))
+
+# Max worker threads for recursive folder traversal
+_TRAVERSE_WORKERS = int(os.getenv("TRAVERSE_WORKERS", "8"))
+
+
+# ─────────────────────────────────────────────
+# Pre-compiled regex patterns (fix #2)
+# ─────────────────────────────────────────────
+
+_RE_NAME_CONTAINS   = re.compile(r"name contains '([^']+)'",   re.I)
+_RE_NAME_EQ         = re.compile(r"name = '([^']+)'",           re.I)
+_RE_MIME_CONTAINS   = re.compile(r"mimetype contains '([^']+)'",re.I)
+_RE_MIME_EQ         = re.compile(r"mimetype = '([^']+)'",        re.I)
+_RE_MOD_GT          = re.compile(r"modifiedtime > '([^']+)'",   re.I)
+_RE_MOD_LT          = re.compile(r"modifiedtime < '([^']+)'",   re.I)
+_RE_TRASHED         = re.compile(r"trashed\s*=\s*false",         re.I)
+
+# For _mime_matches helper
+_RE_MIME_C_ALL      = re.compile(r"mimetype contains '([^']+)'", re.I)
+_RE_MIME_EQ_ALL     = re.compile(r"mimetype = '([^']+)'",         re.I)
 
 
 # ─────────────────────────────────────────────
@@ -81,34 +102,73 @@ def _get_service():
 
 class _FileCache:
     """
-    Stores a flat list of all file metadata dicts from the root folder
-    (recursively). Folders themselves are excluded from the list but their
-    children are included with a 'folder_path' field so the agent can answer
-    "which folder is this in?".
+    Flat list of all file metadata dicts from the root folder (recursively).
+    Folders are excluded; children carry a 'folder_path' field.
+
+    Also stores:
+      - _sorted_by_mtime: pre-sorted list for get_recent_files (fix #4)
+      - _folder_ids: set of all folder IDs seen during traversal (fix #1)
+      - _fulltext_cache: TTL cache for Drive API fullText results (fix #3)
     """
 
     def __init__(self):
         self._files: list[dict] = []
+        self._sorted_by_mtime: list[dict] = []
+        self._folder_ids: set[str] = set()
         self._lock = threading.RLock()
         self._last_refresh: float = 0.0
+
+        # fullText TTL cache: {query_str: (timestamp, [files])}
+        self._fulltext_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._ft_lock = threading.Lock()
 
     def get_all(self) -> list[dict]:
         with self._lock:
             return list(self._files)
 
+    def get_sorted_by_mtime(self) -> list[dict]:
+        """Pre-sorted list — no re-sort on every call (fix #4)."""
+        with self._lock:
+            return list(self._sorted_by_mtime)
+
+    def get_folder_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._folder_ids)
+
+    def get_fulltext_cached(self, q: str) -> list[dict] | None:
+        """Return cached fullText result if still fresh, else None."""
+        with self._ft_lock:
+            entry = self._fulltext_cache.get(q)
+            if entry and (time.time() - entry[0]) < FULLTEXT_CACHE_TTL:
+                logger.debug("fullText cache hit: %s", q)
+                return list(entry[1])
+        return None
+
+    def set_fulltext_cached(self, q: str, files: list[dict]) -> None:
+        with self._ft_lock:
+            self._fulltext_cache[q] = (time.time(), files)
+
     def refresh(self, folder_id: str) -> None:
         logger.info("Cache refresh started for folder %s", folder_id)
         try:
-            files = _recursive_list(folder_id, "/")
+            files, folder_ids = _recursive_list(folder_id, "/")
+            sorted_files = sorted(
+                files, key=lambda f: f.get("modifiedTime", ""), reverse=True
+            )
             with self._lock:
                 self._files = files
+                self._sorted_by_mtime = sorted_files
+                self._folder_ids = folder_ids
                 self._last_refresh = time.time()
-            logger.info("Cache refresh complete — %d file(s) indexed", len(files))
+            # Invalidate fullText cache on refresh so stale results don't linger
+            with self._ft_lock:
+                self._fulltext_cache.clear()
+            logger.info("Cache refresh complete — %d file(s), %d folder(s) indexed",
+                        len(files), len(folder_ids))
         except Exception as exc:
             logger.error("Cache refresh failed: %s", exc)
 
     def start_background_refresh(self, folder_id: str) -> None:
-        """Refresh once immediately, then keep refreshing in the background."""
         def loop():
             while True:
                 self.refresh(folder_id)
@@ -122,7 +182,7 @@ _cache = _FileCache()
 
 
 # ─────────────────────────────────────────────
-# Recursive folder traversal
+# Recursive folder traversal — concurrent (fix #5)
 # ─────────────────────────────────────────────
 
 def _list_page(service, folder_id: str, page_token: str | None) -> dict:
@@ -138,27 +198,61 @@ def _list_page(service, folder_id: str, page_token: str | None) -> dict:
     )
 
 
-def _recursive_list(folder_id: str, current_path: str) -> list[dict]:
-    """Return every non-folder file under folder_id, recursively."""
+def _recursive_list(
+    root_folder_id: str,
+    root_path: str,
+) -> tuple[list[dict], set[str]]:
+    """
+    Concurrently traverse all subfolders.
+    Returns (flat_file_list, set_of_all_folder_ids).
+    """
     service = _get_service()
     all_files: list[dict] = []
-    page_token = None
+    all_folder_ids: set[str] = {root_folder_id}
+    lock = threading.Lock()
 
-    while True:
-        resp = _list_page(service, folder_id, page_token)
-        for item in resp.get("files", []):
-            if item["mimeType"] == _FOLDER_MIME:
-                # Recurse into subfolder
-                sub_path = current_path.rstrip("/") + "/" + item["name"] + "/"
-                all_files.extend(_recursive_list(item["id"], sub_path))
-            else:
-                item["folder_path"] = current_path  # inject path metadata
-                all_files.append(item)
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+    def process_folder(folder_id: str, current_path: str) -> list[tuple[str, str]]:
+        """List one folder page by page; return (subfolder_id, path) pairs."""
+        local_files: list[dict] = []
+        subfolders: list[tuple[str, str]] = []
+        page_token = None
 
-    return all_files
+        while True:
+            resp = _list_page(service, folder_id, page_token)
+            for item in resp.get("files", []):
+                if item["mimeType"] == _FOLDER_MIME:
+                    sub_path = current_path.rstrip("/") + "/" + item["name"] + "/"
+                    subfolders.append((item["id"], sub_path))
+                else:
+                    item["folder_path"] = current_path
+                    local_files.append(item)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        with lock:
+            all_files.extend(local_files)
+
+        return subfolders
+
+    # BFS with a thread pool
+    queue: list[tuple[str, str]] = [(root_folder_id, root_path)]
+    with ThreadPoolExecutor(max_workers=_TRAVERSE_WORKERS) as pool:
+        while queue:
+            futures = {pool.submit(process_folder, fid, path): (fid, path)
+                       for fid, path in queue}
+            queue = []
+            for future in as_completed(futures):
+                fid, _ = futures[future]
+                try:
+                    subfolders = future.result()
+                    for sub_fid, sub_path in subfolders:
+                        all_folder_ids.add(sub_fid)
+                        queue.append((sub_fid, sub_path))
+                except Exception as exc:
+                    logger.error("Error traversing folder %s: %s", fid, exc)
+
+    return all_files, all_folder_ids
 
 
 # ─────────────────────────────────────────────
@@ -170,13 +264,6 @@ def init_drive_cache() -> None:
     Call this once when your FastAPI app starts.
     Begins recursive indexing of the Drive folder and starts the
     background refresh thread.
-
-    Example in main.py:
-        from drive_client import init_drive_cache
-
-        @app.on_event("startup")
-        async def startup():
-            init_drive_cache()
     """
     folder_id = os.getenv("FOLDER_ID")
     if not folder_id:
@@ -189,41 +276,24 @@ def init_drive_cache() -> None:
 # ─────────────────────────────────────────────
 
 def list_all_files() -> list[dict]:
-    """Return every file in the cached index."""
     return _cache.get_all()
 
 
 def search_files(q: str) -> list[dict]:
     """
-    Run a Google Drive API 'q' query PLUS filter the local cache.
-
-    Strategy:
-      - For simple queries, filter the in-memory cache (fast, no API quota).
-      - For fullText queries or very complex queries, hit the API directly
-        because Drive's full-text index is server-side only.
-
-    This hybrid approach gives you:
-      ✅ Speed for name/mimeType queries (cache)
-      ✅ Accuracy for fullText queries (API)
-      ✅ Freshness for the most recently modified files
+    Hybrid search:
+      - fullText queries → Drive API (with TTL cache so repeats are instant)
+      - Everything else  → fast in-memory cache filter
     """
     q_lower = q.lower()
 
-    # fullText queries must go to the API — we don't have file contents locally
     if "fulltext contains" in q_lower:
         return _api_search(q)
 
-    # Everything else: filter the local cache
     return _cache_search(q)
 
 
 def search_files_in_named_folders(folder_name_fragment: str, extra_q: str = "") -> list[dict]:
-    """
-    Return files whose folder_path contains folder_name_fragment (case-insensitive).
-    Optionally filter by an additional mimeType clause from extra_q.
-
-    E.g. search_files_in_named_folders("invoice", "mimeType contains 'image/'")
-    """
     fragment = folder_name_fragment.lower()
     results = []
     for f in _cache.get_all():
@@ -239,30 +309,20 @@ def search_files_in_named_folders(folder_name_fragment: str, extra_q: str = "") 
 
 
 # ─────────────────────────────────────────────
-# Cache-based query parser
+# Cache-based query parser (fix #2 — pre-compiled regex)
 # ─────────────────────────────────────────────
 
 def _mime_matches(mime: str, q_fragment: str) -> bool:
-    """Check if a MIME type satisfies any mimeType clause in q_fragment.
-
-    Handles multiple OR'd clauses like:
-        (mimeType = 'application/pdf' or mimeType = 'image/png' or ...)
-    Returns True if ANY clause matches.
-    """
-    import re
-
+    """Return True if any mimeType clause in q_fragment matches mime (OR logic)."""
     q = q_fragment.lower()
     mime_lower = mime.lower()
 
-    # Collect ALL mimeType contains '...' values
-    contains_vals = re.findall(r"mimetype contains '([^']+)'", q)
-    # Collect ALL mimeType = '...' values
-    equals_vals = re.findall(r"mimetype = '([^']+)'", q)
+    contains_vals = _RE_MIME_C_ALL.findall(q)
+    equals_vals   = _RE_MIME_EQ_ALL.findall(q)
 
     if not contains_vals and not equals_vals:
-        return True  # no MIME filter at all — pass through
+        return True  # no MIME filter — pass through
 
-    # OR logic: return True if ANY clause matches
     for val in contains_vals:
         if val in mime_lower:
             return True
@@ -274,96 +334,69 @@ def _mime_matches(mime: str, q_fragment: str) -> bool:
 
 
 def _cache_search(q: str) -> list[dict]:
-    """
-    Parse a subset of Drive 'q' syntax and filter the in-memory cache.
-    Supports: name contains, name =, mimeType =, mimeType contains,
-              modifiedTime >, AND, OR (flat, no nested parens).
-    """
-    import re
-
     files = _cache.get_all()
-    results = []
-
-    # Normalise: lowercase operators for parsing
-    q_norm = q.strip()
-
-    for f in files:
-        if _eval_q(q_norm, f):
-            results.append(f)
-
-    return results
+    return [f for f in files if _eval_q(q.strip(), f)]
 
 
 def _eval_q(q: str, f: dict) -> bool:
-    """Very lightweight Drive 'q' evaluator for cache filtering."""
-    import re
-
+    """Lightweight Drive 'q' evaluator using pre-compiled patterns."""
     q = q.strip()
 
-    # AND — split on ' and ' (case-insensitive), all must be true
-    # OR  — split on ' or '  (case-insensitive), any must be true
-    # Simple approach: handle OR groups inside parens first, then AND
-
-    # Remove outer parentheses wrapping the whole expression
+    # Strip balanced outer parens
     while q.startswith("(") and q.endswith(")"):
         inner = q[1:-1]
-        # Make sure the parens are balanced before stripping
         if _balanced(inner):
             q = inner.strip()
         else:
             break
 
-    # Top-level AND split
+    # trashed = false short-circuit (very common clause, no regex needed)
+    if q.lower() == "trashed = false":
+        return True
+
+    # Top-level AND
     and_parts = _split_top_level(q, " and ")
     if len(and_parts) > 1:
         return all(_eval_q(p, f) for p in and_parts)
 
-    # Top-level OR split
+    # Top-level OR
     or_parts = _split_top_level(q, " or ")
     if len(or_parts) > 1:
         return any(_eval_q(p, f) for p in or_parts)
 
-    # Leaf clause
+    # Leaf clause — use pre-compiled patterns
     q = q.strip().strip("()")
-    name = f.get("name", "").lower()
-    mime = f.get("mimeType", "").lower()
+    name     = f.get("name", "").lower()
+    mime     = f.get("mimeType", "").lower()
     modified = f.get("modifiedTime", "")
 
-    # name contains 'x'
-    m = re.match(r"name contains '([^']+)'", q, re.I)
+    m = _RE_NAME_CONTAINS.match(q)
     if m:
         return m.group(1).lower() in name
 
-    # name = 'x'
-    m = re.match(r"name = '([^']+)'", q, re.I)
+    m = _RE_NAME_EQ.match(q)
     if m:
         return name == m.group(1).lower()
 
-    # mimeType contains 'x'
-    m = re.match(r"mimetype contains '([^']+)'", q, re.I)
+    m = _RE_MIME_CONTAINS.match(q)
     if m:
         return m.group(1).lower() in mime
 
-    # mimeType = 'x'
-    m = re.match(r"mimetype = '([^']+)'", q, re.I)
+    m = _RE_MIME_EQ.match(q)
     if m:
         return mime == m.group(1).lower()
 
-    # modifiedTime > 'YYYY-MM-DDTHH:MM:SS'
-    m = re.match(r"modifiedtime > '([^']+)'", q, re.I)
+    m = _RE_MOD_GT.match(q)
     if m:
         return modified >= m.group(1)
 
-    # modifiedTime < 'x'
-    m = re.match(r"modifiedtime < '([^']+)'", q, re.I)
+    m = _RE_MOD_LT.match(q)
     if m:
         return modified < m.group(1)
 
-    # trashed = false — always false in our cache (we skip trashed in recursive scan)
-    if re.match(r"trashed\s*=\s*false", q, re.I):
-        return True
+    if _RE_TRASHED.match(q):
+        return True  # we never index trashed files
 
-    # Unknown clause — pass through (safe default)
     logger.debug("Unknown q clause (passing through): %s", q)
     return True
 
@@ -384,10 +417,11 @@ def _split_top_level(q: str, sep: str) -> list[str]:
     """Split q on sep only when not inside parentheses."""
     parts = []
     depth = 0
-    buf = []
+    buf: list[str] = []
     i = 0
     sep_lower = sep.lower()
     q_lower = q.lower()
+    sep_len = len(sep)
     while i < len(q):
         if q[i] == "(":
             depth += 1
@@ -397,10 +431,10 @@ def _split_top_level(q: str, sep: str) -> list[str]:
             depth -= 1
             buf.append(q[i])
             i += 1
-        elif depth == 0 and q_lower[i:i+len(sep)] == sep_lower:
+        elif depth == 0 and q_lower[i:i + sep_len] == sep_lower:
             parts.append("".join(buf).strip())
             buf = []
-            i += len(sep)
+            i += sep_len
         else:
             buf.append(q[i])
             i += 1
@@ -410,38 +444,62 @@ def _split_top_level(q: str, sep: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# API-based search (for fullText queries)
+# API-based search for fullText queries (fix #1 + fix #3)
 # ─────────────────────────────────────────────
 
 def _api_search(q: str) -> list[dict]:
     """
-    Run a query directly against the Drive API.
-    Used when the query contains fullText contains which
-    requires server-side indexing.
-    """
-    service = _get_service()
-    folder_id = os.getenv("FOLDER_ID", "")
-    # Scope the fullText search to the shared folder
-    scoped_q = f"({q}) and '{folder_id}' in parents and trashed = false"
+    Run a fullText query against the Drive API.
 
-    all_files = []
-    page_token = None
-    while True:
-        resp = (
-            service.files()
-            .list(
-                q=scoped_q,
-                fields=f"nextPageToken, files({_FILE_FIELDS})",
-                pageSize=100,
-                pageToken=page_token,
+    Fix #1: Scopes the search to ALL known folder IDs (not just root),
+            so files in subfolders are found.
+    Fix #3: Results are cached for FULLTEXT_CACHE_TTL seconds.
+    """
+    cached = _cache.get_fulltext_cached(q)
+    if cached is not None:
+        return cached
+
+    service = _get_service()
+    root_folder_id = os.getenv("FOLDER_ID", "")
+
+    # Build an OR clause covering root + all known subfolders
+    folder_ids = _cache.get_folder_ids()
+    if not folder_ids:
+        folder_ids = {root_folder_id}
+
+    # Drive API 'q' has a length limit; batch into chunks of 50 folders
+    all_results: list[dict] = []
+    seen_ids: set[str] = set()
+    folder_list = list(folder_ids)
+    chunk_size = 50
+
+    for i in range(0, len(folder_list), chunk_size):
+        chunk = folder_list[i: i + chunk_size]
+        parents_clause = " or ".join(f"'{fid}' in parents" for fid in chunk)
+        scoped_q = f"({q}) and ({parents_clause}) and trashed = false"
+
+        page_token = None
+        while True:
+            resp = (
+                service.files()
+                .list(
+                    q=scoped_q,
+                    fields=f"nextPageToken, files({_FILE_FIELDS})",
+                    pageSize=100,
+                    pageToken=page_token,
+                )
+                .execute()
             )
-            .execute()
-        )
-        all_files.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return all_files
+            for f in resp.get("files", []):
+                if f["id"] not in seen_ids:
+                    seen_ids.add(f["id"])
+                    all_results.append(f)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    _cache.set_fulltext_cached(q, all_results)
+    return all_results
 
 
 # ─────────────────────────────────────────────
@@ -449,27 +507,14 @@ def _api_search(q: str) -> list[dict]:
 # ─────────────────────────────────────────────
 
 def extract_text(file: dict) -> str | None:
-    """
-    Extract plain text from a file. Returns None if extraction is not
-    supported for this MIME type.
-
-    Supported:
-      - Google Docs  → export as text/plain
-      - Google Sheets → export as text/csv
-      - Google Slides → export as text/plain
-      - PDF          → download + PyMuPDF (if installed)
-      - DOCX         → download + python-docx (if installed)
-      - Plain text   → download directly
-    """
     service = _get_service()
     mime = file.get("mimeType", "")
     file_id = file["id"]
 
     try:
-        # ── Google Workspace types ──────────────────────────────────────
         export_map = {
-            "application/vnd.google-apps.document": "text/plain",
-            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.document":     "text/plain",
+            "application/vnd.google-apps.spreadsheet":  "text/csv",
             "application/vnd.google-apps.presentation": "text/plain",
         }
         if mime in export_map:
@@ -480,7 +525,6 @@ def extract_text(file: dict) -> str | None:
             )
             return data.decode("utf-8", errors="replace")
 
-        # ── Binary downloads ────────────────────────────────────────────
         buf = io.BytesIO()
         request = service.files().get_media(fileId=file_id)
         downloader = MediaIoBaseDownload(buf, request)
@@ -491,22 +535,20 @@ def extract_text(file: dict) -> str | None:
 
         if mime == "application/pdf":
             return _extract_pdf(raw)
-
         if mime == _DOCX_MIME:
             return _extract_docx(raw)
-
         if mime.startswith("text/"):
             return raw.decode("utf-8", errors="replace")
 
     except Exception as exc:
-        logger.warning("Text extraction failed for %s (%s): %s", file.get("name"), mime, exc)
-
+        logger.warning("Text extraction failed for %s (%s): %s",
+                       file.get("name"), mime, exc)
     return None
 
 
 def _extract_pdf(raw: bytes) -> str | None:
     try:
-        import fitz  # PyMuPDF
+        import fitz
         doc = fitz.open(stream=raw, filetype="pdf")
         return "\n".join(page.get_text() for page in doc)
     except ImportError:
@@ -516,7 +558,7 @@ def _extract_pdf(raw: bytes) -> str | None:
 
 def _extract_docx(raw: bytes) -> str | None:
     try:
-        import docx  # python-docx
+        import docx
         import io as _io
         doc = docx.Document(_io.BytesIO(raw))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
@@ -530,11 +572,9 @@ def _extract_docx(raw: bytes) -> str | None:
 # ─────────────────────────────────────────────
 
 def get_file_by_id(file_id: str) -> dict | None:
-    """Return a single file's metadata by ID (from cache first, then API)."""
     for f in _cache.get_all():
         if f["id"] == file_id:
             return f
-    # Fallback to API if not in cache
     try:
         service = _get_service()
         return service.files().get(fileId=file_id, fields=_FILE_FIELDS).execute()
@@ -544,11 +584,6 @@ def get_file_by_id(file_id: str) -> dict | None:
 
 
 def get_folder_tree() -> dict:
-    """
-    Return a nested dict representing the folder hierarchy.
-    Useful for "which folder contains X?" type queries.
-    """
-    # Build path → [files] map from cache
     tree: dict[str, list[dict]] = {}
     for f in _cache.get_all():
         path = f.get("folder_path", "/")
@@ -557,24 +592,18 @@ def get_folder_tree() -> dict:
 
 
 def get_recent_files(n: int = 20) -> list[dict]:
-    """Return the n most recently modified files."""
-    files = _cache.get_all()
-    files.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
-    return files[:n]
+    """Return the n most recently modified files — uses pre-sorted cache (fix #4)."""
+    return _cache.get_sorted_by_mtime()[:n]
 
 
 def get_files_by_type(mime_type: str) -> list[dict]:
-    """
-    Return all files matching a MIME type (exact or prefix).
-    E.g. get_files_by_type('image/') returns all images.
-    """
     if mime_type.endswith("/"):
-        return [f for f in _cache.get_all() if f.get("mimeType", "").startswith(mime_type)]
+        return [f for f in _cache.get_all()
+                if f.get("mimeType", "").startswith(mime_type)]
     return [f for f in _cache.get_all() if f.get("mimeType") == mime_type]
 
 
 def get_cache_stats() -> dict:
-    """Return cache health info — useful for a /health endpoint."""
     files = _cache.get_all()
     mime_counts: dict[str, int] = {}
     for f in files:
