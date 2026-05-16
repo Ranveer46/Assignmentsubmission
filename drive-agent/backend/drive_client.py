@@ -11,6 +11,14 @@ Fixes applied vs v1:
   5. _recursive_list uses a thread pool (up to 8 workers) for concurrent subfolder
      traversal — cuts cold-start indexing time significantly on deep trees.
   6. _cache_search short-circuits on trashed=false immediately (no regex needed).
+
+Bug fixes vs v2:
+  7. search_files_in_named_folders now uses path-segment matching instead of plain
+     substring so 'pics' does NOT match 'epics' or 'topics'.
+  8. Cache readiness guard: init_drive_cache() blocks until the first full scan
+     is complete, so no tool ever runs against an empty or partial cache.
+  9. folder_path is always stored with a trailing slash normalised so segment
+     splitting is consistent ('/pics/' splits cleanly on '/').
 """
 
 from __future__ import annotations
@@ -118,9 +126,16 @@ class _FileCache:
         self._lock = threading.RLock()
         self._last_refresh: float = 0.0
 
+        # Fix #8: set after the FIRST full scan so callers can block on it
+        self._ready = threading.Event()
+
         # fullText TTL cache: {query_str: (timestamp, [files])}
         self._fulltext_cache: dict[str, tuple[float, list[dict]]] = {}
         self._ft_lock = threading.Lock()
+
+    def wait_until_ready(self, timeout: float = 60.0) -> bool:
+        """Block until the first full Drive scan completes. Returns True if ready."""
+        return self._ready.wait(timeout=timeout)
 
     def get_all(self) -> list[dict]:
         with self._lock:
@@ -165,6 +180,8 @@ class _FileCache:
                 self._fulltext_cache.clear()
             logger.info("Cache refresh complete — %d file(s), %d folder(s) indexed",
                         len(files), len(folder_ids))
+            # Fix #8: signal readiness after first successful scan
+            self._ready.set()
         except Exception as exc:
             logger.error("Cache refresh failed: %s", exc)
 
@@ -262,13 +279,17 @@ def _recursive_list(
 def init_drive_cache() -> None:
     """
     Call this once when your FastAPI app starts.
-    Begins recursive indexing of the Drive folder and starts the
-    background refresh thread.
+    Starts the background refresh thread and BLOCKS until the first full scan
+    is complete (fix #8) — so no request is served against an empty cache.
     """
     folder_id = os.getenv("FOLDER_ID")
     if not folder_id:
         raise RuntimeError("FOLDER_ID env var is not set.")
     _cache.start_background_refresh(folder_id)
+    ready = _cache.wait_until_ready(timeout=120.0)
+    if not ready:
+        logger.warning("Drive cache did not finish initial scan within 120s — proceeding anyway")
+    logger.info("init_drive_cache: cache is ready")
 
 
 # ─────────────────────────────────────────────
@@ -294,11 +315,23 @@ def search_files(q: str) -> list[dict]:
 
 
 def search_files_in_named_folders(folder_name_fragment: str, extra_q: str = "") -> list[dict]:
-    fragment = folder_name_fragment.lower()
+    """
+    Return files whose folder_path contains folder_name_fragment as a full
+    path segment (fix #7).
+
+    Path segments are the slash-delimited parts of folder_path, e.g.:
+      /pics/tmp/  →  segments: ['pics', 'tmp']
+
+    So searching for 'pics' matches /pics/ and /pics/tmp/ but NOT /epics/ or /topics/.
+    Matching is case-insensitive.
+    """
+    fragment = folder_name_fragment.lower().strip("/")
     results = []
     for f in _cache.get_all():
-        path = f.get("folder_path", "").lower()
-        if fragment in path:
+        raw_path = f.get("folder_path", "")
+        # Split on '/' and check each segment exactly
+        segments = [s.lower() for s in raw_path.strip("/").split("/") if s]
+        if fragment in segments:
             if not extra_q:
                 results.append(f)
             else:
