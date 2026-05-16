@@ -298,8 +298,8 @@ if user_input:
                     reply = (
                         "⏳ **Rate limit / quota**\n\n"
                         f"{detail}\n\n"
-                        "Try again after a short wait, use Clear Chat, or adjust GEMINI_MODEL / quotas "
-                        "for Google AI (Gemini)."
+                        "Try again after a short wait, use Clear Chat, or adjust GROQ_MODEL / quotas "
+                        "for Groq (https://console.groq.com/)."
                     )
                 else:
                     reply = f"⚠️ Backend error {resp.status_code}: {resp.text}"

@@ -1,4 +1,5 @@
 import os
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -111,19 +112,34 @@ async def chat(req: ChatRequest):
     # Build messages: history + new user message
     messages = history + [HumanMessage(content=req.message)]
 
-    try:
-        result = get_agent().invoke({"messages": messages})
-    except Exception as e:
-        if _is_provider_rate_limit(e):
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    "LLM provider rate limit or quota (often Google Gemini). Wait and retry, use "
-                    "Clear Chat to shorten context, try a smaller/faster model via GEMINI_MODEL in .env, "
-                    "or check quotas at https://aistudio.google.com/ and https://ai.google.dev/pricing"
-                ),
-            )
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+    # Retry up to 3 times on rate-limit errors with exponential backoff (5s, 10s, 20s)
+    _RETRY_DELAYS = [5, 10, 20]
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            result = get_agent().invoke({"messages": messages})
+            last_exc = None
+            break  # success
+        except Exception as e:
+            last_exc = e
+            if not _is_provider_rate_limit(e):
+                # Non-rate-limit error — surface immediately
+                raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+            # Rate limit — will retry (or fall through after last attempt)
+
+    if last_exc is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Groq API rate limit or quota exceeded. "
+                "Retried 3 times with backoff but still hitting limits. "
+                "Wait a minute and retry, use Clear Chat to shorten context, "
+                "try a smaller/faster model via GROQ_MODEL in .env (e.g. llama-3.1-8b-instant), "
+                "or check your limits at https://console.groq.com/"
+            ),
+        )
 
     # Extract the final AI response from the result messages
     output_messages = result.get("messages", [])

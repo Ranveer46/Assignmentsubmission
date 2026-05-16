@@ -129,3 +129,63 @@ def list_all_files() -> list[dict]:
         if not page_token:
             break
     return all_files
+
+
+def search_files_in_named_folders(folder_name_contains: str, file_query: str = "") -> list[dict]:
+    """
+    Return all files inside any subfolder whose name contains `folder_name_contains`.
+    Optionally restrict to files matching `file_query` (a Drive API q-string fragment).
+
+    Example:
+        search_files_in_named_folders("qr", "mimeType contains 'image/'")
+        → all images inside every folder whose name contains 'qr' (e.g. 'qr codes').
+    """
+    service = get_drive_service()
+
+    # Find all subfolder IDs in the shared tree first (uses cache)
+    all_folder_ids = get_all_folder_ids(FOLDER_ID)
+    if not all_folder_ids:
+        return []
+
+    # Search for folders whose name matches inside the shared tree
+    parent_clause = " or ".join([f"'{fid}' in parents" for fid in all_folder_ids])
+    folder_query = (
+        f"({parent_clause}) and "
+        f"mimeType = 'application/vnd.google-apps.folder' and "
+        f"name contains '{folder_name_contains}' and trashed = false"
+    )
+    folder_results = service.files().list(
+        q=folder_query,
+        fields="files(id, name)",
+        pageSize=100,
+    ).execute()
+    matched_folder_ids = [f["id"] for f in folder_results.get("files", [])]
+
+    if not matched_folder_ids:
+        return []
+
+    # Retrieve all files within those matched folders
+    child_parent_clause = " or ".join([f"'{fid}' in parents" for fid in matched_folder_ids])
+    if file_query:
+        full_query = f"({child_parent_clause}) and ({file_query}) and trashed = false"
+    else:
+        full_query = f"({child_parent_clause}) and trashed = false"
+
+    all_files: list[dict] = []
+    page_token = None
+    while True:
+        results = (
+            service.files()
+            .list(
+                q=full_query,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)",
+                pageSize=1000,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        all_files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return all_files
