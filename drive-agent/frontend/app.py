@@ -277,7 +277,28 @@ if not st.session_state.messages:
     </div>
     """, unsafe_allow_html=True)
 
-
+    # Token-Friendly Examples
+    st.markdown("""
+    <div style="text-align:center; padding:1.2rem; margin:0 auto; max-width:550px; background:#14141f; border-radius:12px; border:1px solid #252538;">
+        <p style="color:#a0a0be; font-size:0.85rem; margin-bottom:0.8rem; font-weight:600; letter-spacing:0.05em; text-transform:uppercase;">
+            💡 Token-Friendly Prompts
+        </p>
+        <div style="display:flex; flex-direction:column; gap:0.6rem;">
+            <div style="background:#1a1a2e; padding:0.6rem; border-radius:8px; color:#d0d0e0; font-size:0.85rem; border:1px solid #2a2a3e;">
+                "Find invoices modified after 2024-05-01"
+            </div>
+            <div style="background:#1a1a2e; padding:0.6rem; border-radius:8px; color:#d0d0e0; font-size:0.85rem; border:1px solid #2a2a3e;">
+                "Show me the 10 newest files"
+            </div>
+            <div style="background:#1a1a2e; padding:0.6rem; border-radius:8px; color:#d0d0e0; font-size:0.85rem; border:1px solid #2a2a3e;">
+                "What's in the bounceup folder?"
+            </div>
+        </div>
+        <p style="color:#6b6b85; font-size:0.75rem; margin-top:0.8rem; margin-bottom:0;">
+            Use specific filters (like dates or folders) to prevent returning too many files at once.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Status bar
     file_count = fetch_file_count()
