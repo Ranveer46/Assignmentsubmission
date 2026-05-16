@@ -374,7 +374,8 @@ if msgs and msgs[-1]["role"] == "user":
     is_pending = len(msgs) == 1 or msgs[-2]["role"] != "assistant"
     if is_pending:
         with st.chat_message("assistant"):
-            reply = st.write_stream(stream_from_backend(msgs[-1]["content"]))
+            with st.spinner("Waking up AI & Searching Drive... (can take 50s if asleep)"):
+                reply = st.write_stream(stream_from_backend(msgs[-1]["content"]))
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -386,6 +387,7 @@ if user_input := st.chat_input("Ask DriveMind anything about your workspace...")
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        reply = st.write_stream(stream_from_backend(user_input))
+        with st.spinner("Waking up AI & Searching Drive... (can take 50s if asleep)"):
+            reply = st.write_stream(stream_from_backend(user_input))
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
