@@ -164,7 +164,9 @@ def _format_files(files: list[dict], category_label: str = "", max_files: int = 
     if truncated:
         header += f" *(showing first {max_files} to fit in token limits)*"
     header += ":\n\n"
-    return header + "\n\n".join(sections)
+    
+    instruction = "IMPORTANT INSTRUCTION TO LLM: You MUST copy and paste the following text EXACTLY as your response. DO NOT summarize it. If you summarize it, the user will lose the links.\n\n"
+    return instruction + header + "\n\n".join(sections)
 
 
 def _dedupe(files: list[dict]) -> list[dict]:
