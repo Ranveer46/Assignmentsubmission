@@ -176,6 +176,37 @@ def send_to_backend(user_text: str) -> str:
     return str(reply)
 
 
+def stream_from_backend(user_text: str):
+    import json
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages
+        if m["role"] in ("user", "assistant")
+    ]
+    payload = {"message": user_text, "history": history}
+    try:
+        with requests.post(f"{BACKEND_URL}/chat/stream", json=payload, stream=True, timeout=90) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    decoded = line.decode('utf-8')
+                    if decoded.startswith("data: "):
+                        data = decoded[6:]
+                        if data == "[DONE]":
+                            break
+                        if data.startswith("[ERROR]"):
+                            yield f"**Backend error:** {data[7:]}\\n"
+                        else:
+                            try:
+                                yield json.loads(data)
+                            except:
+                                yield data
+    except requests.exceptions.ConnectionError:
+        yield "**Cannot reach the backend.** Make sure FastAPI is running."
+    except Exception as e:
+        yield f"**Error:** {e}"
+
+
 def fetch_file_count():
     """Get indexed file count from backend /health endpoint."""
     if st.session_state.file_count is not None:
@@ -343,9 +374,7 @@ if msgs and msgs[-1]["role"] == "user":
     is_pending = len(msgs) == 1 or msgs[-2]["role"] != "assistant"
     if is_pending:
         with st.chat_message("assistant"):
-            with st.spinner("Searching your Drive..."):
-                reply = send_to_backend(msgs[-1]["content"])
-            st.markdown(reply)
+            reply = st.write_stream(stream_from_backend(msgs[-1]["content"]))
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -357,8 +386,6 @@ if user_input := st.chat_input("Ask DriveMind anything about your workspace...")
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching your Drive..."):
-            reply = send_to_backend(user_input)
-        st.markdown(reply)
+        reply = st.write_stream(stream_from_backend(user_input))
 
     st.session_state.messages.append({"role": "assistant", "content": reply})

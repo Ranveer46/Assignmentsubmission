@@ -192,7 +192,9 @@ async def chat_stream(req: ChatRequest):
                 if kind == "on_chat_model_stream":
                     chunk = event.get("data", {}).get("chunk")
                     if chunk and hasattr(chunk, "content") and chunk.content:
-                        yield f"data: {chunk.content}\n\n"
+                        import json
+                        encoded = json.dumps(chunk.content)
+                        yield f"data: {encoded}\n\n"
         except Exception as exc:
             logger.exception("Streaming error")
             yield f"data: [ERROR] {exc}\n\n"
