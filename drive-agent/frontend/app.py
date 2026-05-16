@@ -226,26 +226,7 @@ with st.sidebar:
         st.session_state.messages.append({"role": "user", "content": "List all files in the Drive"})
         st.rerun()
 
-    st.divider()
 
-    # Categories
-    st.markdown('<p style="color:#6b6b85; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase; font-weight:600;">CATEGORIES</p>', unsafe_allow_html=True)
-
-    if st.button("🖼️  Images", use_container_width=True, key="cat_img"):
-        st.session_state.messages.append({"role": "user", "content": "Show all images and pictures"})
-        st.rerun()
-
-    if st.button("📄  PDFs & Invoices", use_container_width=True, key="cat_inv"):
-        st.session_state.messages.append({"role": "user", "content": "Find all invoice files"})
-        st.rerun()
-
-    if st.button("📝  Docs", use_container_width=True, key="cat_doc"):
-        st.session_state.messages.append({"role": "user", "content": "Show all DOCX Word files"})
-        st.rerun()
-
-    if st.button("📱  QR Codes", use_container_width=True, key="cat_qr"):
-        st.session_state.messages.append({"role": "user", "content": "Find all QR code images"})
-        st.rerun()
 
     st.divider()
 
@@ -296,53 +277,7 @@ if not st.session_state.messages:
     </div>
     """, unsafe_allow_html=True)
 
-    # Feature cards
-    col1, col2, col3 = st.columns(3, gap="medium")
 
-    card_css = (
-        "background:#14141f; border:1px solid #1e1e30; border-radius:14px; "
-        "padding:1.5rem; text-align:center; min-height:180px; "
-        "transition:border-color 0.3s ease;"
-    )
-
-    with col1:
-        st.markdown(f"""
-        <div style="{card_css}">
-            <div style="font-size:1.6rem; margin-bottom:0.7rem;">📊</div>
-            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
-                Search Files
-            </h3>
-            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
-                Find any file by name, type, or content across your entire Drive instantly.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col2:
-        st.markdown(f"""
-        <div style="{card_css}">
-            <div style="font-size:1.6rem; margin-bottom:0.7rem;">🗂️</div>
-            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
-                Smart Categories
-            </h3>
-            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
-                Instantly locate invoices, QR codes, images, and documents with AI routing.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col3:
-        st.markdown(f"""
-        <div style="{card_css}">
-            <div style="font-size:1.6rem; margin-bottom:0.7rem;">⚡</div>
-            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
-                Recent Activity
-            </h3>
-            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
-                Track recently modified files and explore folder contents in real time.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
 
     # Status bar
     file_count = fetch_file_count()
@@ -368,27 +303,7 @@ else:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Suggestion chips (after messages)
-    st.markdown("""
-    <div style="display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:center;
-                margin:1rem 0 0.5rem 0;">
-        <span style="color:#5a5a75; font-size:0.78rem; padding:0.4rem 0;">Try:</span>
-    </div>
-    """, unsafe_allow_html=True)
 
-    chip_col1, chip_col2, chip_col3 = st.columns(3, gap="small")
-    with chip_col1:
-        if st.button("📄 Find invoices", use_container_width=True, key="chip_inv"):
-            st.session_state.messages.append({"role": "user", "content": "Find all invoice files"})
-            st.rerun()
-    with chip_col2:
-        if st.button("🕐 Show recent files", use_container_width=True, key="chip_recent"):
-            st.session_state.messages.append({"role": "user", "content": "Show the 20 most recently modified files"})
-            st.rerun()
-    with chip_col3:
-        if st.button("📱 Search QR codes", use_container_width=True, key="chip_qr"):
-            st.session_state.messages.append({"role": "user", "content": "Find all QR code images"})
-            st.rerun()
 
     # System ready indicator
     st.markdown("""
