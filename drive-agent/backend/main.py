@@ -138,7 +138,11 @@ async def chat(req: ChatRequest):
     # Build LangGraph message list: history + new user message
     messages = []
     for m in req.history:
-        messages.append({"role": m.role, "content": m.content})
+        content = m.content
+        # Truncate huge assistant responses in history to save Tokens Per Minute (TPM)
+        if m.role == "assistant" and len(content) > 800:
+            content = content[:800] + "\n... [History truncated to save Groq token limits]"
+        messages.append({"role": m.role, "content": content})
     messages.append({"role": "user", "content": req.message})
 
     try:
@@ -172,7 +176,10 @@ async def chat_stream(req: ChatRequest):
 
     messages = []
     for m in req.history:
-        messages.append({"role": m.role, "content": m.content})
+        content = m.content
+        if m.role == "assistant" and len(content) > 800:
+            content = content[:800] + "\n... [History truncated to save Groq token limits]"
+        messages.append({"role": m.role, "content": content})
     messages.append({"role": "user", "content": req.message})
 
     async def token_stream() -> AsyncIterator[str]:
