@@ -46,6 +46,13 @@ _MIME_LABEL = {
     "image/webp": "🖼️ WebP",
     "image/gif": "🖼️ GIF",
     "image/bmp": "🖼️ BMP",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "📊 Excel",
+    "video/mp4": "🎥 MP4",
+    "video/quicktime": "🎥 MOV",
+    "application/x-sh": "📜 Shell Script",
+    "text/x-shellscript": "📜 Shell Script",
+    "text/plain": "📝 Text",
+    "text/csv": "📊 CSV",
 }
 
 # All MIME types that can be an invoice (PDF, DOCX, or any scanned image)
@@ -62,11 +69,14 @@ _INVOICE_MIMES = [
 
 _MIME_BUCKET_ORDER = [
     "Images (image/*)",
+    "Videos (video/*)",
     "PDF documents",
     "Word documents (DOCX)",
+    "Excel spreadsheets",
     "Google Docs",
     "Google Sheets",
     "Google Slides",
+    "Code & Scripts",
     "Other Google Drive types",
     "Other files",
 ]
@@ -79,10 +89,16 @@ _MIME_BUCKET_ORDER = [
 def _mime_bucket(mime: str) -> str:
     if mime.startswith("image/"):
         return "Images (image/*)"
+    if mime.startswith("video/"):
+        return "Videos (video/*)"
     if mime == "application/pdf":
         return "PDF documents"
     if mime == _DOCX_MIME:
         return "Word documents (DOCX)"
+    if mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+        return "Excel spreadsheets"
+    if mime in ("application/x-sh", "text/x-shellscript", "text/x-python", "application/json"):
+        return "Code & Scripts"
     if mime == "application/vnd.google-apps.document":
         return "Google Docs"
     if mime == "application/vnd.google-apps.spreadsheet":
