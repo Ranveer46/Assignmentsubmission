@@ -189,7 +189,7 @@ def _build_mime_filter(mimes: list[str]) -> str:
 # ─────────────────────────────────────────────
 
 @tool
-def drive_search_tool(query: str) -> str:
+def drive_search_tool(q: str) -> str:
     """
     Searches the Drive index using a Drive API 'q' parameter string.
     The local cache handles name/mimeType/date queries instantly (no API quota).
@@ -212,7 +212,7 @@ def drive_search_tool(query: str) -> str:
       DOCX:           application/vnd.openxmlformats-officedocument.wordprocessingml.document
       Any image:      mimeType contains 'image/'
     """
-    files = search_files(query)
+    files = search_files(q)
     return _format_files(files)
 
 
