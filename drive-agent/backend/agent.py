@@ -212,8 +212,11 @@ def drive_search_tool(q: str) -> str:
       DOCX:           application/vnd.openxmlformats-officedocument.wordprocessingml.document
       Any image:      mimeType contains 'image/'
     """
-    files = search_files(q)
-    return _format_files(files)
+    try:
+        files = search_files(q)
+        return _format_files(files)
+    except Exception as e:
+        return f"Error executing search query: {e}. Please check your syntax and try again."
 
 
 @tool
@@ -373,8 +376,11 @@ def drive_content_search_tool(keyword: str) -> str:
     The query is automatically scoped to your shared folder.
     """
     q = f"fullText contains '{keyword}' and trashed = false"
-    files = search_files(q)  # drive_client routes fullText to the API automatically
-    return _format_files(files, f"file(s) containing '{keyword}'")
+    try:
+        files = search_files(q)  # drive_client routes fullText to the API automatically
+        return _format_files(files, f"file(s) containing '{keyword}'")
+    except Exception as e:
+        return f"Error executing search query: {e}. Please check your syntax and try again."
 
 
 # ─────────────────────────────────────────────
