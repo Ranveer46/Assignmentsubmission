@@ -1,6 +1,6 @@
 """
-app.py - Streamlit frontend for the Google Drive conversational agent
-Place this file at: drive-agent/frontend/app.py
+app.py - DriveMind AI Dashboard
+Premium Streamlit frontend for the Google Drive AI Agent.
 
 Run:
     cd drive-agent/frontend
@@ -14,87 +14,130 @@ import streamlit as st
 try:
     from dotenv import load_dotenv
     if not load_dotenv(".env"):
-        load_dotenv("../../.env")
+        if not load_dotenv("../.env"):
+            load_dotenv("../../.env")
 except ImportError:
     pass
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
-st.set_page_config(
-    page_title="Drive Assistant",
-    page_icon="🗂️",
-    layout="centered",
-)
+# ── Page Config ───────────────────────────────────────────────────────────────
 
-st.title("🗂️ Google Drive Assistant")
-st.caption("Search, filter, and discover files in your shared Drive — just chat naturally.")
+st.set_page_config(
+    page_title="DriveMind AI",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "file_count" not in st.session_state:
+    st.session_state.file_count = None
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── CSS Injection ─────────────────────────────────────────────────────────────
 
-with st.sidebar:
-    st.header("Drive status")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-    if st.button("🔄 Check connection", use_container_width=True):
-        try:
-            r = requests.get(f"{BACKEND_URL}/health", timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                cache = data.get("cache", {})
-                total = cache.get("total_files", "?")
-                st.success(f"✅ Connected — {total} files indexed")
-                for mime, count in sorted(
-                    cache.get("mime_breakdown", {}).items(), key=lambda x: -x[1]
-                ):
-                    st.text(f"  {count:>4}  {mime}")
-            else:
-                st.error(f"Backend returned HTTP {r.status_code}")
-        except requests.exceptions.ConnectionError:
-            st.error(f"❌ Cannot reach {BACKEND_URL}")
-        except Exception as e:
-            st.error(f"Error: {e}")
+*, *::before, *::after { font-family: 'Inter', -apple-system, sans-serif !important; }
 
-    st.divider()
-    st.subheader("Quick searches")
+.stApp { background: #0c0c14 !important; }
 
-    quick = [
-        ("🖼️ All images",     "Show all images and pictures"),
-        ("📄 All invoices",    "Find all invoice files"),
-        ("📝 Word docs",       "Show all DOCX Word files"),
-        ("📊 QR codes",        "Find all QR code images"),
-        ("🕐 Recent files",    "Show the 20 most recently modified files"),
-        ("📁 List everything", "List all files in the Drive"),
-    ]
+#MainMenu, header, footer, .stDeployButton,
+[data-testid="stToolbar"] { display: none !important; }
 
-    for label, prompt in quick:
-        if st.button(label, use_container_width=True):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            st.rerun()
+/* ── Sidebar ────────────────────────────── */
+[data-testid="stSidebar"] {
+    background: #111119 !important;
+    border-right: 1px solid #1c1c2e !important;
+    padding-top: 0.5rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stMarkdown"] p,
+[data-testid="stSidebar"] [data-testid="stMarkdown"] span,
+[data-testid="stSidebar"] label {
+    color: #a0a0be !important;
+}
+[data-testid="stSidebar"] .stButton > button {
+    background: transparent !important;
+    color: #a0a0be !important;
+    border: 1px solid #252538 !important;
+    border-radius: 10px !important;
+    font-size: 0.85rem !important;
+    padding: 0.55rem 0.9rem !important;
+    transition: all 0.25s ease !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    width: 100% !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: #1a1a2e !important;
+    border-color: #7c3aed !important;
+    color: #e0e0f0 !important;
+}
 
-    st.divider()
-    if st.button("🗑️ Clear chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
+/* ── Chat Messages ──────────────────────── */
+[data-testid="stChatMessage"] {
+    background: #14141f !important;
+    border: 1px solid #1e1e30 !important;
+    border-radius: 14px !important;
+    padding: 1rem 1.2rem !important;
+    margin-bottom: 0.8rem !important;
+}
+[data-testid="stChatMessage"] p,
+[data-testid="stChatMessage"] li { color: #d0d0e0 !important; }
+[data-testid="stChatMessage"] strong { color: #e8e8f0 !important; }
+[data-testid="stChatMessage"] a { color: #8b5cf6 !important; }
+[data-testid="stChatMessage"] h3 {
+    color: #a78bfa !important;
+    font-size: 0.95rem !important;
+}
+[data-testid="stChatMessage"] code {
+    background: #1e1e30 !important;
+    color: #c084fc !important;
+}
 
-# ── Chat history ──────────────────────────────────────────────────────────────
+/* ── Chat Input ─────────────────────────── */
+[data-testid="stChatInput"] {
+    border-color: #252538 !important;
+}
+[data-testid="stChatInput"] textarea {
+    color: #d0d0e0 !important;
+}
+[data-testid="stChatInputSubmitButton"] {
+    color: #7c3aed !important;
+}
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+/* ── Dividers ───────────────────────────── */
+[data-testid="stSidebar"] hr {
+    border-color: #1e1e30 !important;
+}
 
-# ── Backend call ──────────────────────────────────────────────────────────────
+/* ── Status elements ────────────────────── */
+.stSuccess { background: rgba(34,197,94,0.08) !important; border: 1px solid rgba(34,197,94,0.25) !important; border-radius: 10px !important; }
+.stError   { background: rgba(239,68,68,0.08) !important;  border: 1px solid rgba(239,68,68,0.25) !important;  border-radius: 10px !important; }
+.stSpinner > div { color: #7c3aed !important; }
+
+/* ── Scrollbar ──────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0c0c14; }
+::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a55; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Backend Helpers ───────────────────────────────────────────────────────────
 
 def send_to_backend(user_text: str) -> str:
-    """POST to /chat, return reply string. Never raises — always returns a string."""
+    """POST to /chat, return reply string. Never raises."""
     history = [
         {"role": m["role"], "content": m["content"]}
         for m in st.session_state.messages
         if m["role"] in ("user", "assistant")
     ]
     payload = {"message": user_text, "history": history}
-
     try:
         r = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=90)
         r.raise_for_status()
@@ -116,35 +159,248 @@ def send_to_backend(user_text: str) -> str:
     except Exception as e:
         return f"**Unexpected error:** {e}"
 
-    # Parse JSON safely
     try:
         data = r.json()
     except Exception:
         return f"Backend returned non-JSON:\n```\n{r.text[:400]}\n```"
 
-    # Accept whichever key the backend uses for the reply
     reply = (
-        data.get("reply")
-        or data.get("response")
-        or data.get("message")
-        or data.get("output")
-        or data.get("text")
+        data.get("reply") or data.get("response") or
+        data.get("message") or data.get("output") or data.get("text")
     )
-
     if reply is None:
-        # Show the raw payload so it's easy to debug the key name
         return (
             "Got a response but could not find the reply field.\n\n"
-            f"Raw response keys: `{list(data.keys())}`\n\n"
-            f"```json\n{data}\n```"
+            f"Raw response keys: `{list(data.keys())}`"
         )
-
     return str(reply)
 
 
-# ── Handle quick-action buttons ───────────────────────────────────────────────
-# Quick buttons append a user message then call st.rerun().
-# On the next render we detect the unpaired user message and send it.
+def fetch_file_count():
+    """Get indexed file count from backend /health endpoint."""
+    if st.session_state.file_count is not None:
+        return st.session_state.file_count
+    try:
+        r = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        if r.status_code == 200:
+            count = r.json().get("cache", {}).get("total_files", 0)
+            st.session_state.file_count = count
+            return count
+    except Exception:
+        pass
+    return None
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    # Logo
+    st.markdown("""
+    <div style="display:flex; align-items:center; gap:10px; padding:0.5rem 0 1rem 0;">
+        <div style="width:32px; height:32px; background:linear-gradient(135deg,#7c3aed,#a855f7);
+                    border-radius:8px; display:flex; align-items:center; justify-content:center;
+                    font-size:16px;">🧠</div>
+        <span style="font-size:1.15rem; font-weight:700; color:#e8e8f0;">DriveMind AI</span>
+        <span style="background:linear-gradient(135deg,#7c3aed,#9333ea); color:white;
+                     font-size:0.6rem; padding:2px 8px; border-radius:6px;
+                     font-weight:600; letter-spacing:0.05em;">PRO</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # New Chat button
+    if st.button("✨  New Search Chat", use_container_width=True, key="new_chat"):
+        st.session_state.messages = []
+        st.session_state.file_count = None
+        st.rerun()
+
+    st.divider()
+
+    # Navigation
+    st.markdown('<p class="sidebar-section" style="color:#6b6b85; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase; font-weight:600;">NAVIGATIONAL</p>', unsafe_allow_html=True)
+
+    if st.button("📊  Dashboard", use_container_width=True, key="nav_dash"):
+        st.session_state.messages = []
+        st.rerun()
+
+    if st.button("📁  All Files", use_container_width=True, key="nav_all"):
+        st.session_state.messages.append({"role": "user", "content": "List all files in the Drive"})
+        st.rerun()
+
+    st.divider()
+
+    # Categories
+    st.markdown('<p style="color:#6b6b85; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase; font-weight:600;">CATEGORIES</p>', unsafe_allow_html=True)
+
+    if st.button("🖼️  Images", use_container_width=True, key="cat_img"):
+        st.session_state.messages.append({"role": "user", "content": "Show all images and pictures"})
+        st.rerun()
+
+    if st.button("📄  PDFs & Invoices", use_container_width=True, key="cat_inv"):
+        st.session_state.messages.append({"role": "user", "content": "Find all invoice files"})
+        st.rerun()
+
+    if st.button("📝  Docs", use_container_width=True, key="cat_doc"):
+        st.session_state.messages.append({"role": "user", "content": "Show all DOCX Word files"})
+        st.rerun()
+
+    if st.button("📱  QR Codes", use_container_width=True, key="cat_qr"):
+        st.session_state.messages.append({"role": "user", "content": "Find all QR code images"})
+        st.rerun()
+
+    st.divider()
+
+    # Connection status
+    st.markdown('<p style="color:#6b6b85; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase; font-weight:600;">SYSTEM</p>', unsafe_allow_html=True)
+
+    if st.button("🔄  Check Connection", use_container_width=True, key="health_btn"):
+        try:
+            r = requests.get(f"{BACKEND_URL}/health", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                cache = data.get("cache", {})
+                total = cache.get("total_files", "?")
+                st.session_state.file_count = total
+                st.success(f"✅ Connected — {total} files indexed")
+                breakdown = cache.get("mime_breakdown", {})
+                for mime, count in sorted(breakdown.items(), key=lambda x: -x[1])[:6]:
+                    short = mime.split("/")[-1][:20]
+                    st.caption(f"  `{count:>4}`  {short}")
+            else:
+                st.error(f"Backend returned HTTP {r.status_code}")
+        except requests.exceptions.ConnectionError:
+            st.error(f"❌ Cannot reach {BACKEND_URL}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+# ── Main Content ──────────────────────────────────────────────────────────────
+
+if not st.session_state.messages:
+    # ── Landing Page (Getting Started) ────────────────────────────────────────
+
+    # Top spacer
+    st.markdown("<div style='height:4rem'></div>", unsafe_allow_html=True)
+
+    # Hero heading
+    st.markdown("""
+    <div style="text-align:center; padding:0 1rem;">
+        <h1 style="font-size:3rem; font-weight:800; color:#e8e8f0; margin-bottom:0.6rem; line-height:1.15;">
+            Unlock your <span style="background:linear-gradient(135deg,#7c3aed,#a855f7,#c084fc);
+            -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+            background-clip:text;">knowledge.</span>
+        </h1>
+        <p style="color:#7e7e9a; font-size:1.05rem; max-width:520px; margin:0 auto 2.5rem auto; line-height:1.7;">
+            Search, synthesize, and organize your entire Google Drive with
+            professional AI precision.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Feature cards
+    col1, col2, col3 = st.columns(3, gap="medium")
+
+    card_css = (
+        "background:#14141f; border:1px solid #1e1e30; border-radius:14px; "
+        "padding:1.5rem; text-align:center; min-height:180px; "
+        "transition:border-color 0.3s ease;"
+    )
+
+    with col1:
+        st.markdown(f"""
+        <div style="{card_css}">
+            <div style="font-size:1.6rem; margin-bottom:0.7rem;">📊</div>
+            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
+                Search Files
+            </h3>
+            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
+                Find any file by name, type, or content across your entire Drive instantly.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown(f"""
+        <div style="{card_css}">
+            <div style="font-size:1.6rem; margin-bottom:0.7rem;">🗂️</div>
+            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
+                Smart Categories
+            </h3>
+            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
+                Instantly locate invoices, QR codes, images, and documents with AI routing.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col3:
+        st.markdown(f"""
+        <div style="{card_css}">
+            <div style="font-size:1.6rem; margin-bottom:0.7rem;">⚡</div>
+            <h3 style="color:#e0e0f0; font-size:1rem; font-weight:600; margin-bottom:0.5rem;">
+                Recent Activity
+            </h3>
+            <p style="color:#7e7e9a; font-size:0.82rem; line-height:1.5;">
+                Track recently modified files and explore folder contents in real time.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Status bar
+    file_count = fetch_file_count()
+    status_text = f"DriveMind is ready to index {file_count:,} of your files." if file_count else "DriveMind is ready. Start the backend to index your files."
+    status_dot = "🟢" if file_count else "🟡"
+
+    st.markdown(f"""
+    <div style="text-align:center; margin-top:2.5rem;">
+        <p style="color:#6b6b85; font-size:0.82rem;">
+            {status_dot} {status_text}
+        </p>
+        <p style="color:#4a4a60; font-size:0.72rem; margin-top:0.5rem;">
+            🔒 End-to-end encrypted &nbsp;&nbsp;·&nbsp;&nbsp; ⚡ Powered by DriveMind v2.0
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+else:
+    # ── Chat View ─────────────────────────────────────────────────────────────
+
+    # Display all chat messages
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Suggestion chips (after messages)
+    st.markdown("""
+    <div style="display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:center;
+                margin:1rem 0 0.5rem 0;">
+        <span style="color:#5a5a75; font-size:0.78rem; padding:0.4rem 0;">Try:</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    chip_col1, chip_col2, chip_col3 = st.columns(3, gap="small")
+    with chip_col1:
+        if st.button("📄 Find invoices", use_container_width=True, key="chip_inv"):
+            st.session_state.messages.append({"role": "user", "content": "Find all invoice files"})
+            st.rerun()
+    with chip_col2:
+        if st.button("🕐 Show recent files", use_container_width=True, key="chip_recent"):
+            st.session_state.messages.append({"role": "user", "content": "Show the 20 most recently modified files"})
+            st.rerun()
+    with chip_col3:
+        if st.button("📱 Search QR codes", use_container_width=True, key="chip_qr"):
+            st.session_state.messages.append({"role": "user", "content": "Find all QR code images"})
+            st.rerun()
+
+    # System ready indicator
+    st.markdown("""
+    <div style="text-align:center; margin-top:0.3rem;">
+        <span style="background:#1a1a2e; border:1px solid #252538; color:#6b6b85;
+                     font-size:0.68rem; padding:4px 14px; border-radius:12px;
+                     letter-spacing:0.06em;">● SYSTEM READY</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ── Handle pending quick-action messages ──────────────────────────────────────
 
 msgs = st.session_state.messages
 if msgs and msgs[-1]["role"] == "user":
@@ -157,9 +413,9 @@ if msgs and msgs[-1]["role"] == "user":
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
-# ── Chat input box ────────────────────────────────────────────────────────────
+# ── Chat Input ────────────────────────────────────────────────────────────────
 
-if user_input := st.chat_input("Search your Drive… e.g. 'show all images'"):
+if user_input := st.chat_input("Ask DriveMind anything about your workspace..."):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)

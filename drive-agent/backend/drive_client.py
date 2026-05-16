@@ -243,20 +243,34 @@ def search_files_in_named_folders(folder_name_fragment: str, extra_q: str = "") 
 # ─────────────────────────────────────────────
 
 def _mime_matches(mime: str, q_fragment: str) -> bool:
-    """Check if a MIME type satisfies the mimeType clause in q_fragment."""
+    """Check if a MIME type satisfies any mimeType clause in q_fragment.
+
+    Handles multiple OR'd clauses like:
+        (mimeType = 'application/pdf' or mimeType = 'image/png' or ...)
+    Returns True if ANY clause matches.
+    """
+    import re
+
     q = q_fragment.lower()
-    if "mimetype contains" in q:
-        # e.g. mimeType contains 'image/'
-        import re
-        m = re.search(r"mimetype contains '([^']+)'", q)
-        if m:
-            return m.group(1) in mime.lower()
-    if "mimetype =" in q:
-        import re
-        m = re.search(r"mimetype = '([^']+)'", q)
-        if m:
-            return mime.lower() == m.group(1).lower()
-    return True  # no MIME filter, pass through
+    mime_lower = mime.lower()
+
+    # Collect ALL mimeType contains '...' values
+    contains_vals = re.findall(r"mimetype contains '([^']+)'", q)
+    # Collect ALL mimeType = '...' values
+    equals_vals = re.findall(r"mimetype = '([^']+)'", q)
+
+    if not contains_vals and not equals_vals:
+        return True  # no MIME filter at all — pass through
+
+    # OR logic: return True if ANY clause matches
+    for val in contains_vals:
+        if val in mime_lower:
+            return True
+    for val in equals_vals:
+        if mime_lower == val:
+            return True
+
+    return False
 
 
 def _cache_search(q: str) -> list[dict]:
